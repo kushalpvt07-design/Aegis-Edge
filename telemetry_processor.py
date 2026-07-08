@@ -1,4 +1,7 @@
 import os
+import sys
+os.environ['PYSPARK_PYTHON'] = sys.executable
+os.environ['PYSPARK_DRIVER_PYTHON'] = sys.executable
 import urllib.request
 import pyspark
 import pandas as pd
@@ -32,6 +35,8 @@ def predict_anomaly_udf(vibration_series: pd.Series, temp_series: pd.Series) -> 
     
     # Shape becomes (B, 2, 50)
     input_tensor = np.stack([vib_data, temp_data], axis=1).astype(np.float32)
+    # Add this line to prevent overflow:
+    input_tensor = np.clip(input_tensor, -1e6, 1e6) 
     
     # Run the ONNX C++ Execution Graph -> Returns shape (B, 2) Logits
     logits = _ort_session.run(None, {_input_name: input_tensor})[0]
@@ -91,6 +96,7 @@ def initialize_spark_processor():
         .config("spark.executor.memory", "512m") \
         .config("spark.sql.shuffle.partitions", "2") \
         .config("spark.sql.streaming.checkpointLocation", checkpoint_path) \
+        .config("spark.sql.streaming.kafka.useDeprecatedOffsetFetching", "true") \
         .config("spark.jars.packages", f"org.apache.spark:spark-sql-kafka-0-10_2.13:{pyspark.__version__}") \
         .getOrCreate()
 
@@ -143,7 +149,7 @@ def initialize_spark_processor():
         .option("kafka.bootstrap.servers", "localhost:9092") \
         .option("topic", "inference_alerts") \
         .option("checkpointLocation", "./spark_checkpoints_alerts") \
-        .trigger(processingTime="1 second") \
+        .trigger(processingTime="5 seconds") \
         .start()
 
     query.awaitTermination()
