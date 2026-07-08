@@ -134,15 +134,16 @@ def initialize_spark_processor():
     # Convert the entire processed row into a single JSON payload
     kafka_output_stream = scored_df.selectExpr("to_json(struct(*)) AS value")
 
-    # 5. Write Stream - Continuous Processing Mode
-    print("Executing Edge Inference Engine & Routing to Kafka...")
+    # 5. Write Stream - Micro-batching is more stable on Windows than continuous mode
+    print("Executing Micro-batch Processing Engine & Routing to Kafka...")
     query = kafka_output_stream \
         .writeStream \
+        .outputMode("append") \
         .format("kafka") \
         .option("kafka.bootstrap.servers", "localhost:9092") \
         .option("topic", "inference_alerts") \
         .option("checkpointLocation", "./spark_checkpoints_alerts") \
-        .trigger(continuous="50 milliseconds") \
+        .trigger(processingTime="1 second") \
         .start()
 
     query.awaitTermination()
