@@ -17,7 +17,7 @@ _input_name = None
 def predict_anomaly_udf(vibration_series: pd.Series, temp_series: pd.Series) -> pd.Series:
     """
     Executes sub-5ms ONNX inference over a batch of 50-step sliding windows.
-    Expects input series to contain arrays of length 50.
+    Applies Softmax to extract the anomaly risk percentage.
     """
     global _ort_session, _input_name
     if _ort_session is None:
@@ -26,17 +26,24 @@ def predict_anomaly_udf(vibration_series: pd.Series, temp_series: pd.Series) -> 
         _ort_session = ort.InferenceSession("spindle_anomaly_cnn.onnx")
         _input_name = _ort_session.get_inputs()[0].name
         
+    # Extract the arrays from the Pandas Series
     vib_data = np.stack(vibration_series.values)
     temp_data = np.stack(temp_series.values)
     
     # Shape becomes (B, 2, 50)
     input_tensor = np.stack([vib_data, temp_data], axis=1).astype(np.float32)
-    ort_outs = _ort_session.run(None, {_input_name: input_tensor})
     
-    # Extract the anomaly scores (index 1) and return as a Pandas Series
-    # We use [:, 1] instead of flatten() to preserve batch size and extract the correct logit
-    predictions = ort_outs[0][:, 1]
-    return pd.Series(predictions)
+    # Run the ONNX C++ Execution Graph -> Returns shape (B, 2) Logits
+    logits = _ort_session.run(None, {_input_name: input_tensor})[0]
+    
+    # Apply Softmax to convert logits to probabilities along the class axis (axis=1)
+    exp_logits = np.exp(logits - np.max(logits, axis=1, keepdims=True)) # stability fix
+    probabilities = exp_logits / np.sum(exp_logits, axis=1, keepdims=True)
+    
+    # Extract the probability for Class 1 (Anomalous)
+    anomaly_risk_scores = probabilities[:, 1]
+    
+    return pd.Series(anomaly_risk_scores)
 
 def setup_hadoop_winutils():
     # Only run on Windows
@@ -114,7 +121,8 @@ def initialize_spark_processor():
     ).select("data.*")
 
     # 3. Feature Engineering / Windowing Prep
-    features_df = parsed_df.select("vibration_window", "temperature_window")
+    # Include timestamp so it passes through to the dashboard
+    features_df = parsed_df.select("timestamp", "vibration_window", "temperature_window")
 
     # 4. Pipeline Integration Example
     print("Applying Vectorized ONNX Inference...")
@@ -123,15 +131,17 @@ def initialize_spark_processor():
         predict_anomaly_udf(col("vibration_window"), col("temperature_window"))
     )
     
-    # Trigger the kill switch if the network outputs a score higher than 0.85
-    kill_switch_df = scored_df.filter(col("anomaly_score") > 0.85)
+    # Convert the entire processed row into a single JSON payload
+    kafka_output_stream = scored_df.selectExpr("to_json(struct(*)) AS value")
 
-    # 4. Write Stream - Continuous Processing Mode
-    # Using trigger(continuous='50 milliseconds') bypasses micro-batching entirely
-    print("Executing Continuous Processing Engine...")
-    query = kill_switch_df \
+    # 5. Write Stream - Continuous Processing Mode
+    print("Executing Edge Inference Engine & Routing to Kafka...")
+    query = kafka_output_stream \
         .writeStream \
-        .format("console") \
+        .format("kafka") \
+        .option("kafka.bootstrap.servers", "localhost:9092") \
+        .option("topic", "inference_alerts") \
+        .option("checkpointLocation", "./spark_checkpoints_alerts") \
         .trigger(continuous="50 milliseconds") \
         .start()
 
